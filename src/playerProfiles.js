@@ -14,8 +14,8 @@ function generatePublicPlayerId() {
 export async function ensurePlayerProfile(db, userId, username) {
   for (let attempt = 0; attempt < PLAYER_ID_ATTEMPTS; attempt += 1) {
     const inserted = await db.query(
-      `INSERT INTO player_profiles(user_id, display_name, last_seen_at, public_player_id)
-       VALUES($1, $2, CURRENT_TIMESTAMP, $3)
+      `INSERT INTO player_profiles(user_id, display_name, public_player_id)
+       VALUES($1, $2, $3)
        ON CONFLICT DO NOTHING
        RETURNING public_player_id`,
       [userId, username, generatePublicPlayerId()]
@@ -23,10 +23,7 @@ export async function ensurePlayerProfile(db, userId, username) {
     if (inserted.rowCount) return inserted.rows[0].public_player_id;
 
     const existing = await db.query(
-      `UPDATE player_profiles
-       SET last_seen_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1
-       RETURNING public_player_id`,
+      "SELECT public_player_id FROM player_profiles WHERE user_id = $1",
       [userId]
     );
     if (existing.rowCount) return existing.rows[0].public_player_id;

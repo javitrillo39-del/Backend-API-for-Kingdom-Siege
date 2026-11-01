@@ -4,6 +4,14 @@ export function signToken(user) {
   return jwt.sign({ sub: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: "7d" });
 }
 
+export function signPresenceToken(publicPlayerId) {
+  return jwt.sign(
+    { aud: "authenticated", role: "authenticated", sub: publicPlayerId },
+    process.env.SUPABASE_JWT_SECRET,
+    { algorithm: "HS256", expiresIn: "7d" }
+  );
+}
+
 export function requireAuth(req, res, next) {
   const value = req.headers.authorization || "";
   const token = value.startsWith("Bearer ") ? value.slice(7) : null;

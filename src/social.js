@@ -5,7 +5,6 @@ import { ensurePlayerProfile } from "./playerProfiles.js";
 
 const MAX_PAGE = 10_000;
 const MAX_LIMIT = 50;
-const ONLINE_WINDOW_MINUTES = 5;
 const REALM_NAME = "Realm 07";
 const PUBLIC_PLAYER_ID_PATTERN = /^KS-[A-Z0-9]{8}$/i;
 const friendshipStatusSql = `CASE
@@ -252,7 +251,7 @@ export function createSocialRouter(db) {
               COALESCE(p.bio, '') AS bio,
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online,
+              p.last_seen_at AS "lastSeenAt",
               ${friendshipStatusSql}
        FROM users u
        JOIN player_profiles p ON p.user_id = u.id
@@ -268,11 +267,11 @@ export function createSocialRouter(db) {
     const pagination = pageOptions(req.query);
     if (!pagination) return res.status(400).json({ error: "Invalid pagination" });
     const { rows } = await db.query(
-      `SELECT u.id, u.username, '${REALM_NAME}' AS realm,
+      `SELECT u.id, p.public_player_id AS "publicPlayerId", u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online,
+              p.last_seen_at AS "lastSeenAt",
               f.created_at AS "friendsSince"
        FROM friendships f
        JOIN users u ON u.id = CASE
@@ -303,9 +302,10 @@ export function createSocialRouter(db) {
     const { rows } = await db.query(
       `SELECT r.id, r.status, r.created_at AS "createdAt",
               CASE WHEN r.sender_id = $1 THEN 'outgoing' ELSE 'incoming' END AS direction,
-              u.id AS "playerId", u.username, '${REALM_NAME}' AS realm,
+              u.id AS "playerId", p.public_player_id AS "publicPlayerId",
+              u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
+              p.last_seen_at AS "lastSeenAt"
        FROM friend_requests r
        JOIN users u ON u.id = CASE WHEN r.sender_id = $1 THEN r.recipient_id ELSE r.sender_id END
        LEFT JOIN player_profiles p ON p.user_id = u.id
@@ -519,11 +519,11 @@ export function createSocialRouter(db) {
     const pagination = pageOptions(req.query);
     if (!pagination) return res.status(400).json({ error: "Invalid pagination" });
     const { rows } = await db.query(
-      `SELECT u.id, u.username, '${REALM_NAME}' AS realm,
+      `SELECT u.id, p.public_player_id AS "publicPlayerId", u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online,
+              p.last_seen_at AS "lastSeenAt",
               b.created_at AS "blockedAt"
        FROM blocked_users b
        JOIN users u ON u.id = b.blocked_id

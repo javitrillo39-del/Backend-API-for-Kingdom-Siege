@@ -1,5 +1,6 @@
 import "dotenv/config";
 import http from "node:http";
+import jwt from "jsonwebtoken";
 import { createDb } from "../src/db.js";
 
 const port = Number(process.env.PORT) || 3001;
@@ -96,6 +97,64 @@ try {
   const otherProfile = await expectStatus("/me/profile", 200, { token: tokenB });
   const publicIdA = ownProfile.data.publicPlayerId;
   const publicIdB = otherProfile.data.publicPlayerId;
+  const presenceSession = await expectStatus("/presence/session", 200, {
+    method: "POST",
+    token: tokenA,
+    body: { activeSection: "City" }
+  });
+  const presenceClaims = jwt.decode(presenceSession.data.accessToken);
+  check(
+    presenceSession.data.presence.publicPlayerId === publicIdA &&
+    presenceSession.data.presence.username === usernames[0] &&
+    presenceSession.data.presence.realm === "07" &&
+    presenceSession.data.presence.activeSection === "City" &&
+    Object.keys(presenceSession.data.presence).sort().join(",") ===
+      "activeSection,publicPlayerId,realm,username" &&
+    presenceClaims?.sub === publicIdA &&
+    presenceClaims?.role === "authenticated",
+    "Realtime identity contains only public fields and a token subject based on public player ID"
+  );
+  await expectStatus("/presence/session", 400, {
+    method: "POST",
+    token: tokenA,
+    body: { activeSection: "Secret", userId: playerA }
+  });
+  const lastSeenBeforeSectionUpdate = await expectStatus(`/players/${publicIdA}`, 200, {
+    token: tokenA
+  });
+  const sectionUpdate = await expectStatus("/presence/session", 200, {
+    method: "PATCH",
+    token: tokenA,
+    body: { activeSection: "Social" }
+  });
+  check(
+    sectionUpdate.data.lastSeenAt === lastSeenBeforeSectionUpdate.data.player.lastSeenAt,
+    "last-seen writes are throttled to at most once per minute"
+  );
+  await expectStatus("/presence/session", 200, {
+    method: "POST",
+    token: tokenB,
+    body: { activeSection: "Army" }
+  });
+  const presenceProfile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    Boolean(presenceProfile.data.player.lastSeenAt) &&
+      !Object.hasOwn(presenceProfile.data.player, "online"),
+    "offline profiles expose last-seen time instead of a time-based online guess"
+  );
+  await expectStatus("/presence/session", 204, {
+    method: "DELETE",
+    token: tokenB
+  });
+  const profileAfterLogout = await expectStatus(`/players/${publicIdB}`, 200, {
+    token: tokenA
+  });
+  check(
+    Boolean(profileAfterLogout.data.player.lastSeenAt) &&
+      Date.parse(profileAfterLogout.data.player.lastSeenAt) >=
+        Date.parse(presenceProfile.data.player.lastSeenAt),
+    "explicit logout updates last-seen before a player disconnects"
+  );
   check(/^KS-[A-Z0-9]{8}$/.test(publicIdA), "registration assigns a permanent public player ID");
   check(publicIdA !== publicIdB, "new player IDs are unique");
   check(
@@ -115,6 +174,7 @@ try {
     liveCounts.registeredPlayers === originalRegisteredPlayers + 2,
     "registeredPlayers equals the users table count, including the two temporary test accounts"
   );
+  await expectStatus("/presence/session", 401);
   await expectStatus("/players/me", 400, {
     method: "PATCH",
     token: tokenA,
@@ -210,7 +270,7 @@ try {
     "public profile uses public ID and omits credentials"
   );
   const online = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenB });
-  check(online.data.player.online === true, "approximate online status");
+  check(Boolean(online.data.player.lastSeenAt), "profile returns last-seen timestamp");
 
   const selfRequest = await expectStatus("/friends/requests", 400, {
     method: "POST", token: tokenA, body: { playerId: publicIdA }
@@ -251,6 +311,13 @@ try {
   );
   const friends = await expectStatus("/friends?page=1&limit=10", 200, { token: tokenA });
   check(friends.data.friends.some(friend => friend.id === playerB), "friends list includes accepted friend");
+  const listedFriend = friends.data.friends.find(friend => friend.id === playerB);
+  check(
+    listedFriend.publicPlayerId === publicIdB &&
+      Boolean(listedFriend.lastSeenAt) &&
+      !Object.hasOwn(listedFriend, "online"),
+    "friends list exposes public ID and last-seen data without a guessed online flag"
+  );
   const acceptedNotices = await expectStatus("/notifications", 200, { token: tokenA });
   check(
     acceptedNotices.data.notifications.some(item => item.type === "friend_request_accepted"),
@@ -277,9 +344,13 @@ try {
   const blockList = await expectStatus("/blocks?page=1&limit=20", 200, { token: tokenA });
   check(
     blockList.data.blockedPlayers.some(
-      player => player.id === playerB && player.online === true && player.power > 0
+      player => player.id === playerB &&
+        player.publicPlayerId === publicIdB &&
+        Boolean(player.lastSeenAt) &&
+        player.power > 0 &&
+        !Object.hasOwn(player, "online")
     ),
-    "blocked-player list includes live status and power"
+    "blocked-player list includes public identity and last-seen data, not guessed online status"
   );
   const requestsAfterBlock = await expectStatus("/friends/requests", 200, { token: tokenB });
   check(

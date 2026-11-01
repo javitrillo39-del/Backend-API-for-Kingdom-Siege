@@ -9,6 +9,7 @@
     "migrate": "node scripts/migrate.js",
     "migrate:social": "node scripts/migrate-social.js",
     "migrate:public-ids": "node scripts/migrate-public-player-ids.js",
+    "migrate:presence": "node scripts/migrate-presence.js",
     "test:social": "node scripts/test-social.js"
   },
   "dependencies": {

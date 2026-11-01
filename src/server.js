@@ -5,7 +5,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import { createDb, getGame } from "./db.js";
-import { requireAuth, signToken } from "./auth.js";
+import { requireAuth, signPresenceToken, signToken } from "./auth.js";
 import { ensurePlayerProfile } from "./playerProfiles.js";
 import { createSocialRouter } from "./social.js";
 
@@ -39,6 +39,38 @@ const enemies = {
 };
 const powerOf = g => g.troops * 5 + g.castle * 20 + g.barracks * 8;
 const cleanName = value => typeof value === "string" ? value.trim() : "";
+const presenceSections = new Set(["City", "Army", "Map", "Social"]);
+const presenceLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => String(req.user.id)
+});
+
+async function updateLastSeen(userId, force = false) {
+  const { rows } = await db.query(
+    `UPDATE player_profiles
+     SET last_seen_at = CASE
+       WHEN $2::BOOLEAN OR last_seen_at IS NULL
+         OR last_seen_at <= CURRENT_TIMESTAMP - INTERVAL '1 minute'
+       THEN CURRENT_TIMESTAMP
+       ELSE last_seen_at
+     END
+     WHERE user_id = $1
+     RETURNING last_seen_at AS "lastSeenAt"`,
+    [userId, force]
+  );
+  return rows[0] ?? null;
+}
+
+function validPresenceRequest(body) {
+  return body !== null &&
+    typeof body === "object" &&
+    !Array.isArray(body) &&
+    Object.keys(body).length === 1 &&
+    presenceSections.has(body.activeSection);
+}
 
 app.get("/api/health", async (req, res) => {
   try {
@@ -94,6 +126,52 @@ app.get("/api/game", requireAuth, route(async (req, res) => res.json({
   user: { id: req.user.id, username: req.user.username },
   game: await getGame(db, req.user.id)
 })));
+
+app.post("/api/presence/session", requireAuth, presenceLimiter, route(async (req, res) => {
+  if (!process.env.SUPABASE_JWT_SECRET) {
+    return res.status(503).json({ error: "Realtime presence is not configured" });
+  }
+  if (!validPresenceRequest(req.body)) {
+    return res.status(400).json({ error: "A valid activeSection is required" });
+  }
+
+  await ensurePlayerProfile(db, req.user.id, req.user.username);
+  const lastSeen = await updateLastSeen(req.user.id);
+  if (!lastSeen) return res.status(404).json({ error: "Player profile not found" });
+  const { rows } = await db.query(
+    `SELECT p.public_player_id AS "publicPlayerId", u.username
+     FROM player_profiles p
+     JOIN users u ON u.id = p.user_id
+     WHERE p.user_id = $1`,
+    [req.user.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Player profile not found" });
+
+  res.json({
+    accessToken: signPresenceToken(rows[0].publicPlayerId),
+    presence: {
+      publicPlayerId: rows[0].publicPlayerId,
+      username: rows[0].username,
+      realm: "07",
+      activeSection: req.body.activeSection
+    }
+  });
+}));
+
+app.patch("/api/presence/session", requireAuth, presenceLimiter, route(async (req, res) => {
+  if (!validPresenceRequest(req.body)) {
+    return res.status(400).json({ error: "A valid activeSection is required" });
+  }
+  const lastSeen = await updateLastSeen(req.user.id);
+  if (!lastSeen) return res.status(404).json({ error: "Player profile not found" });
+  res.json({ lastSeenAt: lastSeen.lastSeenAt });
+}));
+
+app.delete("/api/presence/session", requireAuth, presenceLimiter, route(async (req, res) => {
+  const lastSeen = await updateLastSeen(req.user.id, true);
+  if (!lastSeen) return res.status(404).json({ error: "Player profile not found" });
+  res.status(204).end();
+}));
 
 app.post("/api/game/upgrade", requireAuth, route(async (req, res) => {
   const type = req.body.type;
