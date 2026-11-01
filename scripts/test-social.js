@@ -1,12 +1,11 @@
 import "dotenv/config";
 import http from "node:http";
-import jwt from "jsonwebtoken";
 import { createDb } from "../src/db.js";
 
 const port = Number(process.env.PORT) || 3001;
 const apiPath = "/api";
 const suffix = Math.random().toString(36).slice(2, 10);
-const usernames = [`ksa_${suffix}`, `ksb_${suffix}`];
+const usernames = [`ksa_${suffix}`, `ksb_${suffix}`, `ksc_${suffix}`];
 const createdUsers = [];
 let passed = 0;
 let originalRegisteredPlayers;
@@ -86,77 +85,106 @@ try {
     body: { username: usernames[1], password: "TestPassword_456" }
   });
   createdUsers.push(usernames[1]);
+  const registerC = await expectStatus("/auth/register", 201, {
+    method: "POST",
+    body: { username: usernames[2], password: "TestPassword_789" }
+  });
+  createdUsers.push(usernames[2]);
 
   const tokenA = registerA.data.token;
   const tokenB = registerB.data.token;
+  const tokenC = registerC.data.token;
   const playerA = registerA.data.user.id;
   const playerB = registerB.data.user.id;
-  check(Boolean(tokenA && tokenB), "registration returns JWTs");
+  check(Boolean(tokenA && tokenB && tokenC), "registration returns JWTs");
 
   const ownProfile = await expectStatus("/me/profile", 200, { token: tokenA });
   const otherProfile = await expectStatus("/me/profile", 200, { token: tokenB });
   const publicIdA = ownProfile.data.publicPlayerId;
   const publicIdB = otherProfile.data.publicPlayerId;
-  const presenceSession = await expectStatus("/presence/session", 200, {
+  const onlineBaseline = await expectStatus("/presence/online-count", 200, { token: tokenA });
+  const existingOnlinePlayers = onlineBaseline.data.onlinePlayers;
+  await expectStatus("/presence/heartbeat", 204, {
     method: "POST",
     token: tokenA,
-    body: { activeSection: "City" }
+    body: { userId: playerB }
   });
-  const presenceClaims = jwt.decode(presenceSession.data.accessToken);
+  const onlineCountA = await expectStatus("/presence/online-count", 200, { token: tokenA });
   check(
-    presenceSession.data.presence.publicPlayerId === publicIdA &&
-    presenceSession.data.presence.username === usernames[0] &&
-    presenceSession.data.presence.realm === "07" &&
-    presenceSession.data.presence.activeSection === "City" &&
-    Object.keys(presenceSession.data.presence).sort().join(",") ===
-      "activeSection,publicPlayerId,realm,username" &&
-    presenceClaims?.sub === publicIdA &&
-    presenceClaims?.role === "authenticated",
-    "Realtime identity contains only public fields and a token subject based on public player ID"
+    onlineCountA.data.onlinePlayers === existingOnlinePlayers + 1 &&
+      Object.keys(onlineCountA.data).join(",") === "onlinePlayers",
+    "heartbeat identity comes only from the JWT, ignoring a client-supplied userId"
   );
-  await expectStatus("/presence/session", 400, {
+  await expectStatus("/presence/heartbeat", 204, {
     method: "POST",
     token: tokenA,
-    body: { activeSection: "Secret", userId: playerA }
+    body: { userId: playerA }
   });
-  const lastSeenBeforeSectionUpdate = await expectStatus(`/players/${publicIdA}`, 200, {
-    token: tokenA
-  });
-  const sectionUpdate = await expectStatus("/presence/session", 200, {
-    method: "PATCH",
-    token: tokenA,
-    body: { activeSection: "Social" }
-  });
+  const duplicateTabCount = await expectStatus("/presence/online-count", 200, { token: tokenA });
   check(
-    sectionUpdate.data.lastSeenAt === lastSeenBeforeSectionUpdate.data.player.lastSeenAt,
-    "last-seen writes are throttled to at most once per minute"
+    duplicateTabCount.data.onlinePlayers === existingOnlinePlayers + 1,
+    "two heartbeats for one account count as one player"
   );
-  await expectStatus("/presence/session", 200, {
+
+  await expectStatus("/presence/heartbeat", 204, {
     method: "POST",
-    token: tokenB,
-    body: { activeSection: "Army" }
+    token: tokenB
   });
+  await expectStatus("/presence/heartbeat", 204, {
+    method: "POST",
+    token: tokenC
+  });
+  const threeOnline = await expectStatus("/presence/online-count", 200, { token: tokenA });
+  check(
+    threeOnline.data.onlinePlayers === existingOnlinePlayers + 3,
+    "three active accounts produce an online count of three"
+  );
+  await expectStatus("/presence/logout", 204, { method: "POST", token: tokenC });
+  const afterLogoutC = await expectStatus("/presence/online-count", 200, { token: tokenA });
+  check(
+    afterLogoutC.data.onlinePlayers === existingOnlinePlayers + 2,
+    "logout immediately removes the account from online count"
+  );
+
+  const presenceDb = await createDb();
+  try {
+    await presenceDb.query(
+      "UPDATE player_profiles SET last_seen_at = CURRENT_TIMESTAMP - INTERVAL '91 seconds' WHERE user_id = $1",
+      [playerA]
+    );
+  } finally {
+    await presenceDb.end();
+  }
+  const afterStaleHeartbeat = await expectStatus("/presence/online-count", 200, { token: tokenB });
+  check(
+    afterStaleHeartbeat.data.onlinePlayers === existingOnlinePlayers + 1,
+    "a player without a heartbeat for 90 seconds is offline"
+  );
+  await expectStatus("/presence/heartbeat", 204, { method: "POST", token: tokenA });
+  const afterReload = await expectStatus("/presence/online-count", 200, { token: tokenA });
+  check(
+    afterReload.data.onlinePlayers === existingOnlinePlayers + 2,
+    "a heartbeat after page reload restores online status"
+  );
+  await expectStatus("/presence/logout", 204, { method: "POST", token: tokenB });
+  const afterLogoutB = await expectStatus("/presence/online-count", 200, { token: tokenA });
+  check(
+    afterLogoutB.data.onlinePlayers === existingOnlinePlayers + 1,
+    "logout immediately lowers the online count"
+  );
+
   const presenceProfile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
   check(
     Boolean(presenceProfile.data.player.lastSeenAt) &&
       !Object.hasOwn(presenceProfile.data.player, "online"),
-    "offline profiles expose last-seen time instead of a time-based online guess"
-  );
-  await expectStatus("/presence/session", 204, {
-    method: "DELETE",
-    token: tokenB
-  });
-  const profileAfterLogout = await expectStatus(`/players/${publicIdB}`, 200, {
-    token: tokenA
-  });
-  check(
-    Boolean(profileAfterLogout.data.player.lastSeenAt) &&
-      Date.parse(profileAfterLogout.data.player.lastSeenAt) >=
-        Date.parse(presenceProfile.data.player.lastSeenAt),
-    "explicit logout updates last-seen before a player disconnects"
+    "public profiles retain their existing safe last-seen response"
   );
   check(/^KS-[A-Z0-9]{8}$/.test(publicIdA), "registration assigns a permanent public player ID");
-  check(publicIdA !== publicIdB, "new player IDs are unique");
+  const profileC = await expectStatus("/me/profile", 200, { token: tokenC });
+  check(
+    publicIdA !== publicIdB && publicIdA !== profileC.data.publicPlayerId && publicIdB !== profileC.data.publicPlayerId,
+    "new player IDs are unique"
+  );
   check(
     ownProfile.data.username === usernames[0] &&
     ownProfile.data.realm === "07" &&
@@ -171,10 +199,12 @@ try {
   );
   check(
     playerStats.data.registeredPlayers === liveCounts.registeredPlayers &&
-    liveCounts.registeredPlayers === originalRegisteredPlayers + 2,
-    "registeredPlayers equals the users table count, including the two temporary test accounts"
+    liveCounts.registeredPlayers === originalRegisteredPlayers + 3,
+    "registeredPlayers equals the users table count, including the three temporary test accounts"
   );
-  await expectStatus("/presence/session", 401);
+  await expectStatus("/presence/heartbeat", 401, { method: "POST" });
+  await expectStatus("/presence/logout", 401, { method: "POST" });
+  await expectStatus("/presence/online-count", 401);
   await expectStatus("/players/me", 400, {
     method: "PATCH",
     token: tokenA,
@@ -309,14 +339,22 @@ try {
     profileAfterAccept.data.player.friendshipStatus === "friends",
     "public profile reflects accepted friendship"
   );
+  await expectStatus("/presence/heartbeat", 204, { method: "POST", token: tokenB });
   const friends = await expectStatus("/friends?page=1&limit=10", 200, { token: tokenA });
   check(friends.data.friends.some(friend => friend.id === playerB), "friends list includes accepted friend");
   const listedFriend = friends.data.friends.find(friend => friend.id === playerB);
   check(
     listedFriend.publicPlayerId === publicIdB &&
-      Boolean(listedFriend.lastSeenAt) &&
-      !Object.hasOwn(listedFriend, "online"),
-    "friends list exposes public ID and last-seen data without a guessed online flag"
+      listedFriend.online === true &&
+      !Object.hasOwn(listedFriend, "lastSeenAt"),
+    "friends list marks an active friend online and omits lastSeenAt"
+  );
+  await expectStatus("/presence/logout", 204, { method: "POST", token: tokenB });
+  const friendsAfterLogout = await expectStatus("/friends?page=1&limit=10", 200, { token: tokenA });
+  const offlineFriend = friendsAfterLogout.data.friends.find(friend => friend.id === playerB);
+  check(
+    offlineFriend.online === false && Object.hasOwn(offlineFriend, "lastSeenAt"),
+    "friends list marks a logged-out friend offline and includes lastSeenAt"
   );
   const acceptedNotices = await expectStatus("/notifications", 200, { token: tokenA });
   check(

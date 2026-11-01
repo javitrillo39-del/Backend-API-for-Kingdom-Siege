@@ -271,7 +271,18 @@ export function createSocialRouter(db) {
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              p.last_seen_at AS "lastSeenAt",
+              CASE
+                WHEN p.last_seen_at > CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+                  AND (p.last_logout_at IS NULL OR p.last_seen_at > p.last_logout_at)
+                THEN TRUE
+                ELSE FALSE
+              END AS online,
+              CASE
+                WHEN p.last_seen_at > CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+                  AND (p.last_logout_at IS NULL OR p.last_seen_at > p.last_logout_at)
+                THEN NULL
+                ELSE p.last_seen_at
+              END AS "lastSeenAt",
               f.created_at AS "friendsSince"
        FROM friendships f
        JOIN users u ON u.id = CASE
@@ -291,7 +302,13 @@ export function createSocialRouter(db) {
       [req.user.id, pagination.limit, pagination.offset]
     );
     res.json({
-      friends: rows,
+      friends: rows.map(friend => {
+        if (friend.online || !friend.lastSeenAt) {
+          const { lastSeenAt, ...friendWithoutLastSeen } = friend;
+          return friendWithoutLastSeen;
+        }
+        return friend;
+      }),
       pagination: { page: pagination.page, limit: pagination.limit }
     });
   }));

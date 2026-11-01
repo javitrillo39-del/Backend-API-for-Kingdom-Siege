@@ -6,7 +6,7 @@ Backend for the horizontal React game. Includes accounts, bcrypt password hashin
 
 1. Install Node.js 20 or newer.
 2. Run `npm install`.
-3. Copy `.env.example` to `.env` and configure `PORT`, private `JWT_SECRET`, `SUPABASE_JWT_SECRET`, `FRONTEND_ORIGIN` and the Supabase PostgreSQL `DATABASE_URL`. Keep `.env` private and out of Git.
+3. Copy `.env.example` to `.env` and configure `PORT`, private `JWT_SECRET`, `FRONTEND_ORIGIN` and the PostgreSQL `DATABASE_URL`. Keep `.env` private and out of Git.
 4. Apply the social schema after the existing PostgreSQL `users` and `games` tables are present:
 
 ```powershell
@@ -14,16 +14,13 @@ npm run migrate:social
 ```
 
 This additive migration does not import, delete or recreate the SQLite backup.
-After public player IDs are migrated, enable Supabase Realtime and apply its
-additive presence policy:
+Then apply the public player ID and API presence migrations:
 
 ```powershell
 npm run migrate:public-ids
 npm run migrate:presence
 ```
 
-`SUPABASE_JWT_SECRET` must be the compatible signing secret for the same
-Supabase project. Never put it in the frontend.
 For local development, start the API:
 
 ```bash
@@ -88,9 +85,9 @@ Enemy IDs are `goblin`, `bandit`, and `shadow`.
 - `GET /api/health`
 - `GET /api/players/search?q=<username>&page=1&limit=20`
 - `GET /api/players/:id`
-- `POST /api/presence/session`
-- `PATCH /api/presence/session`
-- `DELETE /api/presence/session`
+- `POST /api/presence/heartbeat`
+- `POST /api/presence/logout`
+- `GET /api/presence/online-count`
 - `PATCH /api/players/me`
 - `GET /api/friends`
 - `GET /api/friends/requests`
@@ -102,7 +99,7 @@ Enemy IDs are `goblin`, `bandit`, and `shadow`.
 - `DELETE /api/blocks/:playerId`
 - `GET /api/notifications`
 
-Social routes require a valid JWT. Blocking cancels pending requests and hides the blocked player from social searches, profiles and related notifications. Live online state comes from Supabase Realtime Presence and is deduplicated by public player ID; `last_seen_at` is updated at connection/section transitions, limited intervals, and logout. If Realtime is unavailable, the frontend reports that state rather than treating registered accounts as online.
+Social routes require a valid JWT. Blocking cancels pending requests and hides the blocked player from social searches, profiles and related notifications. Presence uses authenticated API heartbeats: a player is online for 90 seconds after the last heartbeat, logout immediately marks the player offline, and active counts are deduplicated by user account. Friends include an `online` status and show `lastSeenAt` only while offline.
 
 Game-changing operations are validated by the server, so a browser cannot simply award itself resources. Run the social integration tests against a running local API and the configured PostgreSQL database:
 
@@ -110,4 +107,4 @@ Game-changing operations are validated by the server, so a browser cannot simply
 npm run test:social
 ```
 
-The test script creates two temporary users and removes only those users afterward.
+The test script creates three temporary users and removes only those users afterward.

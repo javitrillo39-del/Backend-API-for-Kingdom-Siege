@@ -2,8 +2,8 @@ import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import { createDb } from "../src/db.js";
 
-const version = "006_realtime_presence";
-const migrationUrl = new URL("../migrations/006_realtime_presence.sql", import.meta.url);
+const version = "007_api_presence";
+const migrationUrl = new URL("../migrations/007_api_presence.sql", import.meta.url);
 const db = await createDb();
 const client = await db.connect();
 
@@ -21,7 +21,7 @@ try {
     "SELECT to_regclass('public.player_profiles') AS player_profiles"
   );
   if (!rows[0].player_profiles) {
-    throw new Error("The social profile migration must be applied before presence migration.");
+    throw new Error("The social profile migration must be applied before API presence.");
   }
 
   const applied = await client.query(
@@ -34,29 +34,25 @@ try {
     await client.query("INSERT INTO schema_migrations(version) VALUES($1)", [version]);
   }
 
-  const { rows: verification } = await client.query(
-    `SELECT COUNT(*)::INTEGER AS profiles,
-            COUNT(public_player_id)::INTEGER AS "profilesWithPublicIds",
-            COUNT(DISTINCT public_player_id)::INTEGER AS "uniquePublicIds"
-     FROM player_profiles`
-  );
-  const result = verification[0];
-  if (
-    result.profiles !== result.profilesWithPublicIds ||
-    result.profiles !== result.uniquePublicIds
-  ) {
-    throw new Error("Presence migration verification failed.");
+  const { rows: verification } = await client.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE column_name = 'last_seen_at')::INTEGER AS last_seen_at,
+      COUNT(*) FILTER (WHERE column_name = 'last_logout_at')::INTEGER AS last_logout_at
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'player_profiles'
+  `);
+  if (verification[0].last_seen_at !== 1 || verification[0].last_logout_at !== 1) {
+    throw new Error("API presence migration verification failed.");
   }
 
   await client.query("COMMIT");
-  console.log(
-    `Presence migration verified: ${result.profiles} profiles retain unique public IDs.`
-  );
+  console.log("API presence migration verified.");
 } catch (error) {
   try {
     await client.query("ROLLBACK");
   } catch (rollbackError) {
-    console.error("Presence migration rollback failed:", rollbackError.code || "database error");
+    console.error("API presence migration rollback failed:", rollbackError.code || "database error");
   }
   throw error;
 } finally {
