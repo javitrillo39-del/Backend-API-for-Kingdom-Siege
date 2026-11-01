@@ -1,15 +1,22 @@
 # Kingdom Siege API
 
-Backend for the horizontal React game prototype. Includes accounts, JWT login, SQLite persistence, upgrades, training, repairs, attacks, collection and ranking.
+Backend for the horizontal React game. Includes accounts, bcrypt password hashing, JWT login, PostgreSQL persistence, game actions, ranking and the first social features. The local SQLite database is retained only as a backup.
 
 ## Start
 
 1. Install Node.js 20 or newer.
-2. Copy `.env.example` to `.env` and change `JWT_SECRET`.
-3. Run:
+2. Run `npm install`.
+3. Copy `.env.example` to `.env` and configure `PORT`, a private `JWT_SECRET`, `FRONTEND_ORIGIN` and the Supabase PostgreSQL `DATABASE_URL`. Keep `.env` private and out of Git.
+4. Apply the social schema after the existing PostgreSQL `users` and `games` tables are present:
+
+```powershell
+npm run migrate:social
+```
+
+This additive migration does not import, delete or recreate the SQLite backup.
+For local development, start the API:
 
 ```bash
-npm install
 npm run dev
 ```
 
@@ -69,5 +76,25 @@ Enemy IDs are `goblin`, `bandit`, and `shadow`.
 - `POST /api/game/collect`
 - `GET /api/ranking`
 - `GET /api/health`
+- `GET /api/players/search?q=<username>&page=1&limit=20`
+- `GET /api/players/:id`
+- `PATCH /api/players/me`
+- `GET /api/friends`
+- `GET /api/friends/requests`
+- `POST /api/friends/requests`
+- `POST /api/friends/requests/:id/accept`
+- `POST /api/friends/requests/:id/reject`
+- `DELETE /api/friends/:playerId`
+- `POST /api/blocks/:playerId`
+- `DELETE /api/blocks/:playerId`
+- `GET /api/notifications`
 
-Game-changing operations are validated by the server, so a browser cannot simply award itself resources.
+Social routes require a valid JWT. Blocking cancels pending requests and hides the blocked player from social searches, profiles and related notifications. Online status is approximate and based on recent authenticated social activity.
+
+Game-changing operations are validated by the server, so a browser cannot simply award itself resources. Run the social integration tests against a running local API and the configured PostgreSQL database:
+
+```powershell
+npm run test:social
+```
+
+The test script creates two temporary users and removes only those users afterward.

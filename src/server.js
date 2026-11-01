@@ -6,12 +6,24 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import { createDb, getGame } from "./db.js";
 import { requireAuth, signToken } from "./auth.js";
+import { createSocialRouter } from "./social.js";
 
 if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required. Copy .env.example to .env.");
 const db = await createDb();
 const app = express();
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }));
+const configuredFrontendOrigins = process.env.FRONTEND_ORIGINS
+  ?.split(",")
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const frontendOrigins = configuredFrontendOrigins?.length
+  ? [...new Set(configuredFrontendOrigins)]
+  : [...new Set([
+      "http://localhost:5173",
+      "https://kingdom-siege-game.onrender.com",
+      ...(process.env.FRONTEND_ORIGIN ? [process.env.FRONTEND_ORIGIN.trim()] : [])
+    ].filter(Boolean))];
+app.use(cors({ origin: frontendOrigins }));
 app.use(express.json({ limit: "32kb" }));
 app.use("/api", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 
@@ -194,6 +206,8 @@ app.get("/api/ranking", route(async (req, res) => {
   );
   res.json({ ranking: rows });
 }));
+
+app.use("/api", createSocialRouter(db));
 
 app.use((err, req, res, next) => {
   console.error("API request failed:", err.code || "unexpected error");
