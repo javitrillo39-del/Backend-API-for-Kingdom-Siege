@@ -12,6 +12,7 @@ import { createSocialRouter } from "./social.js";
 if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required. Copy .env.example to .env.");
 const db = await createDb();
 const app = express();
+app.set("trust proxy", 1);
 app.use(helmet());
 const configuredFrontendOrigins = process.env.FRONTEND_ORIGINS
   ?.split(",")
