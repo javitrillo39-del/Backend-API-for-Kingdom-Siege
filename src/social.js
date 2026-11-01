@@ -87,7 +87,8 @@ const socialLimiter = (windowMs, limit) => rateLimit({
   limit,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: req => String(req.user.id)
+  keyGenerator: req => String(req.user.id),
+  handler: (_req, res) => res.status(429).json({ error: "RATE_LIMITED" })
 });
 
 async function withTransaction(db, operation) {

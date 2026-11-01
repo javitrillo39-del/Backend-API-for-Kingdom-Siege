@@ -10,7 +10,10 @@
     "migrate:social": "node scripts/migrate-social.js",
     "migrate:public-ids": "node scripts/migrate-public-player-ids.js",
     "migrate:presence": "node scripts/migrate-api-presence.js",
-    "test:social": "node scripts/test-social.js"
+    "migrate:chat": "node scripts/migrate-chat.js",
+    "test:error-codes": "node --test scripts/test-error-codes.js",
+    "test:social": "node scripts/test-social.js",
+    "test:chat": "node scripts/test-chat.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

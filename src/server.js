@@ -7,7 +7,9 @@ import bcrypt from "bcryptjs";
 import { createDb, getGame } from "./db.js";
 import { requireAuth, signToken } from "./auth.js";
 import { ensurePlayerProfile } from "./playerProfiles.js";
+import { createChatRouter } from "./chat.js";
 import { createSocialRouter } from "./social.js";
+import { stableErrorResponse } from "./errorCodes.js";
 
 if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required. Copy .env.example to .env.");
 const db = await createDb();
@@ -27,7 +29,14 @@ const frontendOrigins = configuredFrontendOrigins?.length
     ].filter(Boolean))];
 app.use(cors({ origin: frontendOrigins }));
 app.use(express.json({ limit: "32kb" }));
-app.use("/api", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
+app.use(stableErrorResponse);
+app.use("/api", rateLimit({
+  windowMs: 60_000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "RATE_LIMITED" })
+}));
 
 const route = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const buildings = {
@@ -45,7 +54,8 @@ const presenceLimiter = rateLimit({
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: req => String(req.user.id)
+  keyGenerator: req => String(req.user.id),
+  handler: (_req, res) => res.status(429).json({ error: "RATE_LIMITED" })
 });
 
 app.get("/api/health", async (req, res) => {
@@ -128,7 +138,8 @@ app.post("/api/presence/logout", requireAuth, presenceLimiter, route(async (req,
 
 app.get("/api/presence/online-count", requireAuth, presenceLimiter, route(async (req, res) => {
   const { rows } = await db.query(
-    `SELECT COUNT(DISTINCT p.user_id)::INTEGER AS "onlinePlayers"
+    `SELECT COUNT(DISTINCT p.user_id)::INTEGER AS "onlinePlayers",
+            CURRENT_TIMESTAMP AS "calculatedAt"
      FROM player_profiles p
      JOIN users u ON u.id = p.user_id
      WHERE p.last_seen_at > CURRENT_TIMESTAMP - INTERVAL '90 seconds'
@@ -254,11 +265,12 @@ app.get("/api/ranking", route(async (req, res) => {
   res.json({ ranking: rows });
 }));
 
+app.use("/api", createChatRouter(db));
 app.use("/api", createSocialRouter(db));
 
 app.use((err, req, res, next) => {
   console.error("API request failed:", err.code || "unexpected error");
-  res.status(500).json({ error: "Server error" });
+  res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
 });
 
 const port = Number(process.env.PORT) || 3001;

@@ -26,6 +26,7 @@ async function getAccountCounts() {
 }
 
 function request(path, { method = "GET", token, body } = {}) {
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const headers = {};
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -47,7 +48,7 @@ function request(path, { method = "GET", token, body } = {}) {
         } catch {
           data = raw;
         }
-        resolve({ status: response.statusCode, data });
+        resolve({ status: response.statusCode, data, elapsedMs: Date.now() - startedAt });
       });
     });
     req.on("error", reject);
@@ -104,17 +105,36 @@ try {
   const publicIdB = otherProfile.data.publicPlayerId;
   const onlineBaseline = await expectStatus("/presence/online-count", 200, { token: tokenA });
   const existingOnlinePlayers = onlineBaseline.data.onlinePlayers;
-  await expectStatus("/presence/heartbeat", 204, {
+  check(
+    Number.isSafeInteger(existingOnlinePlayers) &&
+      Number.isFinite(Date.parse(onlineBaseline.data.calculatedAt)) &&
+      Object.keys(onlineBaseline.data).sort().join(",") === "calculatedAt,onlinePlayers",
+    "online count always includes a numeric count and ISO calculation time"
+  );
+  const initialHeartbeat = await expectStatus("/presence/heartbeat", 204, {
     method: "POST",
     token: tokenA,
     body: { userId: playerB }
   });
+  check(initialHeartbeat.elapsedMs < 2_000, "heartbeat responds quickly");
   const onlineCountA = await expectStatus("/presence/online-count", 200, { token: tokenA });
   check(
     onlineCountA.data.onlinePlayers === existingOnlinePlayers + 1 &&
-      Object.keys(onlineCountA.data).join(",") === "onlinePlayers",
+      Number.isFinite(Date.parse(onlineCountA.data.calculatedAt)) &&
+      new Date(onlineCountA.data.calculatedAt).toISOString() === onlineCountA.data.calculatedAt,
     "heartbeat identity comes only from the JWT, ignoring a client-supplied userId"
   );
+  const heartbeatDb = await createDb();
+  try {
+    const { rows } = await heartbeatDb.query(
+      `SELECT ABS(EXTRACT(EPOCH FROM (last_seen_at - CURRENT_TIMESTAMP))) < 5 AS "serverTimestampRecent"
+       FROM player_profiles WHERE user_id = $1`,
+      [playerA]
+    );
+    check(rows[0]?.serverTimestampRecent, "heartbeat stores the database server timestamp");
+  } finally {
+    await heartbeatDb.end();
+  }
   await expectStatus("/presence/heartbeat", 204, {
     method: "POST",
     token: tokenA,

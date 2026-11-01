@@ -19,6 +19,7 @@ Then apply the public player ID and API presence migrations:
 ```powershell
 npm run migrate:public-ids
 npm run migrate:presence
+npm run migrate:chat
 ```
 
 For local development, start the API:
@@ -88,6 +89,13 @@ Enemy IDs are `goblin`, `bandit`, and `shadow`.
 - `POST /api/presence/heartbeat`
 - `POST /api/presence/logout`
 - `GET /api/presence/online-count`
+- `GET /api/chat/channels`
+- `GET /api/chat/channels/:channelId/messages?page=1&limit=50`
+- `POST /api/chat/channels/:channelId/messages`
+- `POST /api/chat/private/:publicPlayerId`
+- `POST /api/chat/messages/:messageId/report`
+- `POST /api/chat/mute/:publicPlayerId`
+- `DELETE /api/chat/mute/:publicPlayerId`
 - `PATCH /api/players/me`
 - `GET /api/friends`
 - `GET /api/friends/requests`
@@ -100,11 +108,22 @@ Enemy IDs are `goblin`, `bandit`, and `shadow`.
 - `GET /api/notifications`
 
 Social routes require a valid JWT. Blocking cancels pending requests and hides the blocked player from social searches, profiles and related notifications. Presence uses authenticated API heartbeats: a player is online for 90 seconds after the last heartbeat, logout immediately marks the player offline, and active counts are deduplicated by user account. Friends include an `online` status and show `lastSeenAt` only while offline.
+Error responses use stable uppercase codes in the `error` field so clients can localize them without displaying server-authored English text.
+Chat requires a JWT. Global chat is shared by authenticated players; realm
+chat uses the realm persisted in the server-side profile; private channels
+require an active friendship. Message history is paginated, private messages
+are hidden after a block or friendship removal, and user mutes hide messages
+from that player only for the muting account. Reports are stored for later
+moderation without physically deleting messages. Chat messages accept plain
+text only, have a 300-character limit, reject links/markup, and are limited to
+five per player every ten seconds.
 
 Game-changing operations are validated by the server, so a browser cannot simply award itself resources. Run the social integration tests against a running local API and the configured PostgreSQL database:
 
 ```powershell
+npm run test:error-codes
 npm run test:social
+npm run test:chat
 ```
 
 The test script creates three temporary users and removes only those users afterward.
