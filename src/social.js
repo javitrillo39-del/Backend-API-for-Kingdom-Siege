@@ -8,6 +8,24 @@ const MAX_LIMIT = 50;
 const ONLINE_WINDOW_MINUTES = 5;
 const REALM_NAME = "Realm 07";
 const PUBLIC_PLAYER_ID_PATTERN = /^KS-[A-Z0-9]{8}$/i;
+const friendshipStatusSql = `CASE
+  WHEN EXISTS (
+    SELECT 1 FROM blocked_users b
+    WHERE b.blocker_id = $1 AND b.blocked_id = u.id
+  ) THEN 'blocked'
+  WHEN EXISTS (
+    SELECT 1 FROM friendships f
+    WHERE f.player_low_id = LEAST($1::integer, u.id)
+      AND f.player_high_id = GREATEST($1::integer, u.id)
+  ) THEN 'friends'
+  WHEN EXISTS (
+    SELECT 1 FROM friend_requests r
+    WHERE r.status = 'pending'
+      AND LEAST(r.sender_id, r.recipient_id) = LEAST($1::integer, u.id)
+      AND GREATEST(r.sender_id, r.recipient_id) = GREATEST($1::integer, u.id)
+  ) THEN 'pending'
+  ELSE 'none'
+END AS "friendshipStatus"`;
 
 const asyncRoute = handler => (req, res, next) =>
   Promise.resolve(handler(req, res, next)).catch(next);
@@ -130,10 +148,10 @@ export function createSocialRouter(db) {
 
   router.get("/me/profile", asyncRoute(async (req, res) => {
     const { rows } = await db.query(
-      `SELECT p.public_player_id AS id, u.username, '07' AS realm,
+      `SELECT p.public_player_id AS "publicPlayerId", u.username, '07' AS realm,
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
+              'none' AS "friendshipStatus"
        FROM users u
        JOIN player_profiles p ON p.user_id = u.id
        LEFT JOIN games g ON g.user_id = u.id
@@ -160,11 +178,10 @@ export function createSocialRouter(db) {
     }
 
     const { rows } = await db.query(
-      `SELECT p.public_player_id AS id, u.username, '${REALM_NAME}' AS realm,
-              COALESCE(p.display_name, u.username) AS "displayName",
+      `SELECT p.public_player_id AS "publicPlayerId", u.username, '07' AS realm,
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
+              ${friendshipStatusSql}
        FROM users u
        JOIN player_profiles p ON p.user_id = u.id
        LEFT JOIN games g ON g.user_id = u.id
@@ -230,17 +247,18 @@ export function createSocialRouter(db) {
     }
 
     const { rows } = await db.query(
-      `SELECT p.public_player_id AS id, u.username, '${REALM_NAME}' AS realm,
+      `SELECT p.public_player_id AS "publicPlayerId", u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(p.bio, '') AS bio,
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
-              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
+              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online,
+              ${friendshipStatusSql}
        FROM users u
        JOIN player_profiles p ON p.user_id = u.id
        LEFT JOIN games g ON g.user_id = u.id
-       WHERE u.id = $1`,
-      [playerId]
+       WHERE u.id = $2`,
+      [req.user.id, playerId]
     );
     if (!rows.length) return res.status(404).json({ error: "Player not found" });
     res.json({ player: rows[0] });

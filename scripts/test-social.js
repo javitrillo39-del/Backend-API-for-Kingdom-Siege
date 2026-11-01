@@ -8,6 +8,22 @@ const suffix = Math.random().toString(36).slice(2, 10);
 const usernames = [`ksa_${suffix}`, `ksb_${suffix}`];
 const createdUsers = [];
 let passed = 0;
+let originalRegisteredPlayers;
+
+async function getAccountCounts() {
+  const db = await createDb();
+  try {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::INTEGER AS "registeredPlayers",
+              COUNT(DISTINCT p.public_player_id)::INTEGER AS "uniquePublicIds"
+       FROM users u
+       LEFT JOIN player_profiles p ON p.user_id = u.id`
+    );
+    return rows[0];
+  } finally {
+    await db.end();
+  }
+}
 
 function request(path, { method = "GET", token, body } = {}) {
   return new Promise((resolve, reject) => {
@@ -57,6 +73,7 @@ async function expectStatus(path, expected, options = {}) {
 }
 
 try {
+  originalRegisteredPlayers = (await getAccountCounts()).registeredPlayers;
   await expectStatus("/health", 200);
   const registerA = await expectStatus("/auth/register", 201, {
     method: "POST",
@@ -77,8 +94,8 @@ try {
 
   const ownProfile = await expectStatus("/me/profile", 200, { token: tokenA });
   const otherProfile = await expectStatus("/me/profile", 200, { token: tokenB });
-  const publicIdA = ownProfile.data.id;
-  const publicIdB = otherProfile.data.id;
+  const publicIdA = ownProfile.data.publicPlayerId;
+  const publicIdB = otherProfile.data.publicPlayerId;
   check(/^KS-[A-Z0-9]{8}$/.test(publicIdA), "registration assigns a permanent public player ID");
   check(publicIdA !== publicIdB, "new player IDs are unique");
   check(
@@ -88,14 +105,23 @@ try {
     "own profile contains safe public stats without internal IDs"
   );
   const playerStats = await expectStatus("/players/stats", 200, { token: tokenA });
-  check(playerStats.data.registeredPlayers >= 2, "player statistics count registered users");
+  const liveCounts = await getAccountCounts();
+  check(
+    liveCounts.uniquePublicIds === liveCounts.registeredPlayers,
+    "every registered user has a unique public player ID"
+  );
+  check(
+    playerStats.data.registeredPlayers === liveCounts.registeredPlayers &&
+    liveCounts.registeredPlayers === originalRegisteredPlayers + 2,
+    "registeredPlayers equals the users table count, including the two temporary test accounts"
+  );
   await expectStatus("/players/me", 400, {
     method: "PATCH",
     token: tokenA,
     body: { publicPlayerId: "KS-AAAAAAAA" }
   });
   const profileAfterLogin = await expectStatus("/me/profile", 200, { token: tokenA });
-  check(profileAfterLogin.data.id === publicIdA, "public player ID remains unchanged");
+  check(profileAfterLogin.data.publicPlayerId === publicIdA, "public player ID remains unchanged");
 
   const login = await expectStatus("/auth/login", 200, {
     method: "POST",
@@ -136,10 +162,16 @@ try {
     200,
     { token: tokenA }
   );
+  const usernameMatch = search.data.players.find(player => player.publicPlayerId === publicIdB);
   check(
-    search.data.players.some(player => player.id === publicIdB) &&
-    !search.data.players.some(player => player.id === playerB),
-    "username search returns public ID instead of internal user ID"
+    usernameMatch?.username === usernames[1] &&
+    !Object.keys(usernameMatch || {}).some(key => /password|email|token|secret|database_url|user_id/i.test(key)),
+    "username search returns the real username and a safe public profile"
+  );
+  const profileBeforeRequest = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    profileBeforeRequest.data.player.friendshipStatus === "none",
+    "public profile friendship status is evaluated for the authenticated viewer"
   );
   const caseInsensitiveSearch = await expectStatus(
     `/players/search?q=${usernames[1].toUpperCase()}&page=1&limit=10`,
@@ -147,7 +179,9 @@ try {
     { token: tokenA }
   );
   check(
-    caseInsensitiveSearch.data.players.some(player => player.id === publicIdB),
+    caseInsensitiveSearch.data.players.some(
+      player => player.publicPlayerId === publicIdB && player.username === usernames[1]
+    ),
     "username search ignores case"
   );
   const idSearch = await expectStatus(
@@ -155,10 +189,21 @@ try {
     200,
     { token: tokenA }
   );
-  check(idSearch.data.players.some(player => player.id === publicIdB), "search finds exact public ID case-insensitively");
+  const publicIdMatch = idSearch.data.players.find(player => player.publicPlayerId === publicIdB);
+  check(
+    publicIdMatch?.username === usernames[1] &&
+    publicIdMatch.friendshipStatus === "none" &&
+    JSON.stringify(Object.keys(publicIdMatch).sort()) ===
+      JSON.stringify(["friendshipStatus", "power", "publicPlayerId", "realm", "username", "victories"]),
+    "exact public-ID search returns the same real username and safe response shape"
+  );
+  check(
+    usernameMatch?.publicPlayerId === publicIdMatch?.publicPlayerId,
+    "username and public-ID searches find the same player"
+  );
   const profile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
   check(
-    profile.data.player.id === publicIdB &&
+    profile.data.player.publicPlayerId === publicIdB &&
     profile.data.player.username === usernames[1] &&
     profile.data.player.realm === "Realm 07" &&
     !Object.keys(profile.data.player).some(key => /password|email|secret|token|database_url|user_id/i.test(key)),
@@ -175,6 +220,11 @@ try {
     method: "POST", token: tokenA, body: { playerId: publicIdB }
   });
   const requestId = sentRequest.data.request.id;
+  const profileAfterRequest = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    profileAfterRequest.data.player.friendshipStatus === "pending",
+    "public profile reflects the pending friendship status"
+  );
   await expectStatus("/friends/requests", 409, {
     method: "POST", token: tokenA, body: { playerId: publicIdB }
   });
@@ -194,6 +244,11 @@ try {
   await expectStatus(`/friends/requests/${requestId}/accept`, 200, {
     method: "POST", token: tokenB, body: {}
   });
+  const profileAfterAccept = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    profileAfterAccept.data.player.friendshipStatus === "friends",
+    "public profile reflects accepted friendship"
+  );
   const friends = await expectStatus("/friends?page=1&limit=10", 200, { token: tokenA });
   check(friends.data.friends.some(friend => friend.id === playerB), "friends list includes accepted friend");
   const acceptedNotices = await expectStatus("/notifications", 200, { token: tokenA });
@@ -242,13 +297,16 @@ try {
     { token: tokenA }
   );
   check(
-    blockedSearch.data.players.some(player => player.id === publicIdB),
+    blockedSearch.data.players.some(
+      player => player.publicPlayerId === publicIdB && player.friendshipStatus === "blocked"
+    ),
     "players blocked by the current user remain searchable by public ID"
   );
   const blockedProfile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
   check(
-    blockedProfile.data.player.id === publicIdB,
-    "profile remains visible for a player blocked by the current user"
+    blockedProfile.data.player.publicPlayerId === publicIdB &&
+    blockedProfile.data.player.friendshipStatus === "blocked",
+    "profile remains visible and reports blocked status"
   );
   await expectStatus("/friends/requests", 409, {
     method: "POST", token: tokenB, body: { playerId: playerA }
@@ -264,7 +322,12 @@ try {
     200,
     { token: tokenA }
   );
-  check(unblockedSearch.data.players.some(player => player.id === publicIdB), "unblocked player visible");
+  check(
+    unblockedSearch.data.players.some(
+      player => player.publicPlayerId === publicIdB && player.friendshipStatus === "none"
+    ),
+    "unblocked player visible"
+  );
 
   await expectStatus("/friends", 401);
   await expectStatus("/players/search?q=%25", 400, { token: tokenA });
@@ -285,6 +348,11 @@ try {
         throw new Error("Not all temporary test users were removed.");
       }
       console.log(`Removed ${rowCount} temporary test users.`);
+      const finalCounts = await getAccountCounts();
+      if (finalCounts.registeredPlayers !== originalRegisteredPlayers) {
+        throw new Error("The registered-user count did not return to its original value after cleanup.");
+      }
+      console.log("Verified temporary accounts were removed and registeredPlayers returned to its original count.");
     } catch (error) {
       console.error(`Temporary-user cleanup failed: ${error.code || error.message || "database error"}`);
       process.exitCode = 1;
