@@ -5,7 +5,7 @@ import { createDb } from "../src/db.js";
 const port = Number(process.env.PORT) || 3001;
 const apiPath = "/api";
 const suffix = Math.random().toString(36).slice(2, 10);
-const usernames = [`ksa${suffix}`, `ksb${suffix}`];
+const usernames = [`ksa_${suffix}`, `ksb_${suffix}`];
 const createdUsers = [];
 let passed = 0;
 
@@ -75,6 +75,28 @@ try {
   const playerB = registerB.data.user.id;
   check(Boolean(tokenA && tokenB), "registration returns JWTs");
 
+  const ownProfile = await expectStatus("/me/profile", 200, { token: tokenA });
+  const otherProfile = await expectStatus("/me/profile", 200, { token: tokenB });
+  const publicIdA = ownProfile.data.id;
+  const publicIdB = otherProfile.data.id;
+  check(/^KS-[A-Z0-9]{8}$/.test(publicIdA), "registration assigns a permanent public player ID");
+  check(publicIdA !== publicIdB, "new player IDs are unique");
+  check(
+    ownProfile.data.username === usernames[0] &&
+    ownProfile.data.realm === "07" &&
+    !Object.keys(ownProfile.data).some(key => /password|email|token|secret|database_url|user_id/i.test(key)),
+    "own profile contains safe public stats without internal IDs"
+  );
+  const playerStats = await expectStatus("/players/stats", 200, { token: tokenA });
+  check(playerStats.data.registeredPlayers >= 2, "player statistics count registered users");
+  await expectStatus("/players/me", 400, {
+    method: "PATCH",
+    token: tokenA,
+    body: { publicPlayerId: "KS-AAAAAAAA" }
+  });
+  const profileAfterLogin = await expectStatus("/me/profile", 200, { token: tokenA });
+  check(profileAfterLogin.data.id === publicIdA, "public player ID remains unchanged");
+
   const login = await expectStatus("/auth/login", 200, {
     method: "POST",
     body: { username: usernames[0], password: "TestPassword_123" }
@@ -82,7 +104,13 @@ try {
   check(Boolean(login.data.token), "login returns JWT");
 
   const game = await expectStatus("/game", 200, { token: tokenA });
-  check(Boolean(game.data.game), "legacy game response");
+  check(
+    game.data.user?.id === playerA &&
+    game.data.user?.username === usernames[0] &&
+    Object.keys(game.data.user).sort().join(",") === "id,username" &&
+    Boolean(game.data.game),
+    "authenticated game response includes only public user identity and game"
+  );
   await expectStatus("/game/upgrade", 200, {
     method: "POST", token: tokenA, body: { type: "farm" }
   });
@@ -108,27 +136,47 @@ try {
     200,
     { token: tokenA }
   );
-  check(search.data.players.some(player => player.id === playerB), "search includes matching player");
-  const profile = await expectStatus(`/players/${playerB}`, 200, { token: tokenA });
   check(
+    search.data.players.some(player => player.id === publicIdB) &&
+    !search.data.players.some(player => player.id === playerB),
+    "username search returns public ID instead of internal user ID"
+  );
+  const caseInsensitiveSearch = await expectStatus(
+    `/players/search?q=${usernames[1].toUpperCase()}&page=1&limit=10`,
+    200,
+    { token: tokenA }
+  );
+  check(
+    caseInsensitiveSearch.data.players.some(player => player.id === publicIdB),
+    "username search ignores case"
+  );
+  const idSearch = await expectStatus(
+    `/players/search?q=${publicIdB.toLowerCase()}&page=1&limit=10`,
+    200,
+    { token: tokenA }
+  );
+  check(idSearch.data.players.some(player => player.id === publicIdB), "search finds exact public ID case-insensitively");
+  const profile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    profile.data.player.id === publicIdB &&
     profile.data.player.username === usernames[1] &&
     profile.data.player.realm === "Realm 07" &&
-    !Object.keys(profile.data.player).some(key => /password|secret|token|database_url/i.test(key)),
-    "public profile includes realm and omits credentials"
+    !Object.keys(profile.data.player).some(key => /password|email|secret|token|database_url|user_id/i.test(key)),
+    "public profile uses public ID and omits credentials"
   );
-  const online = await expectStatus(`/players/${playerB}`, 200, { token: tokenB });
+  const online = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenB });
   check(online.data.player.online === true, "approximate online status");
 
   const selfRequest = await expectStatus("/friends/requests", 400, {
-    method: "POST", token: tokenA, body: { playerId: playerA }
+    method: "POST", token: tokenA, body: { playerId: publicIdA }
   });
   check(selfRequest.data.error, "self-request validation");
   const sentRequest = await expectStatus("/friends/requests", 201, {
-    method: "POST", token: tokenA, body: { playerId: playerB }
+    method: "POST", token: tokenA, body: { playerId: publicIdB }
   });
   const requestId = sentRequest.data.request.id;
   await expectStatus("/friends/requests", 409, {
-    method: "POST", token: tokenA, body: { playerId: playerB }
+    method: "POST", token: tokenA, body: { playerId: publicIdB }
   });
   await expectStatus(`/friends/requests/${requestId}/accept`, 404, {
     method: "POST", token: tokenA, body: {}
@@ -168,7 +216,7 @@ try {
   await expectStatus(`/blocks/${playerA}`, 400, {
     method: "POST", token: tokenA, body: {}
   });
-  await expectStatus(`/blocks/${playerB}`, 200, {
+  await expectStatus(`/blocks/${publicIdB}`, 200, {
     method: "POST", token: tokenA, body: {}
   });
   const blockList = await expectStatus("/blocks?page=1&limit=20", 200, { token: tokenA });
@@ -193,8 +241,15 @@ try {
     200,
     { token: tokenA }
   );
-  check(!blockedSearch.data.players.some(player => player.id === playerB), "blocked player hidden in search");
-  await expectStatus(`/players/${playerB}`, 404, { token: tokenA });
+  check(
+    blockedSearch.data.players.some(player => player.id === publicIdB),
+    "players blocked by the current user remain searchable by public ID"
+  );
+  const blockedProfile = await expectStatus(`/players/${publicIdB}`, 200, { token: tokenA });
+  check(
+    blockedProfile.data.player.id === publicIdB,
+    "profile remains visible for a player blocked by the current user"
+  );
   await expectStatus("/friends/requests", 409, {
     method: "POST", token: tokenB, body: { playerId: playerA }
   });
@@ -209,7 +264,7 @@ try {
     200,
     { token: tokenA }
   );
-  check(unblockedSearch.data.players.some(player => player.id === playerB), "unblocked player visible");
+  check(unblockedSearch.data.players.some(player => player.id === publicIdB), "unblocked player visible");
 
   await expectStatus("/friends", 401);
   await expectStatus("/players/search?q=%25", 400, { token: tokenA });

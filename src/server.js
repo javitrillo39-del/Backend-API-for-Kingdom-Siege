@@ -6,6 +6,7 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import { createDb, getGame } from "./db.js";
 import { requireAuth, signToken } from "./auth.js";
+import { ensurePlayerProfile } from "./playerProfiles.js";
 import { createSocialRouter } from "./social.js";
 
 if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required. Copy .env.example to .env.");
@@ -64,6 +65,7 @@ app.post("/api/auth/register", route(async (req, res) => {
       [username, hash]
     );
     const user = inserted.rows[0];
+    await ensurePlayerProfile(client, user.id, user.username);
     await client.query("INSERT INTO games(user_id) VALUES($1)", [user.id]);
     await client.query("COMMIT");
     res.status(201).json({ token: signToken(user), user, game: await getGame(db, user.id) });
@@ -88,7 +90,10 @@ app.post("/api/auth/login", route(async (req, res) => {
   res.json({ token: signToken(user), user: { id: user.id, username: user.username }, game: await getGame(db, user.id) });
 }));
 
-app.get("/api/game", requireAuth, route(async (req, res) => res.json({ game: await getGame(db, req.user.id) })));
+app.get("/api/game", requireAuth, route(async (req, res) => res.json({
+  user: { id: req.user.id, username: req.user.username },
+  game: await getGame(db, req.user.id)
+})));
 
 app.post("/api/game/upgrade", requireAuth, route(async (req, res) => {
   const type = req.body.type;

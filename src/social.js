@@ -1,11 +1,13 @@
 import express from "express";
 import rateLimit from "express-rate-limit";
 import { requireAuth } from "./auth.js";
+import { ensurePlayerProfile } from "./playerProfiles.js";
 
 const MAX_PAGE = 10_000;
 const MAX_LIMIT = 50;
 const ONLINE_WINDOW_MINUTES = 5;
 const REALM_NAME = "Realm 07";
+const PUBLIC_PLAYER_ID_PATTERN = /^KS-[A-Z0-9]{8}$/i;
 
 const asyncRoute = handler => (req, res, next) =>
   Promise.resolve(handler(req, res, next)).catch(next);
@@ -15,6 +17,23 @@ const parseId = value => {
   const id = Number(value);
   return Number.isSafeInteger(id) ? id : null;
 };
+
+const isPlayerReference = value =>
+  parseId(value) !== null ||
+  (typeof value === "string" && PUBLIC_PLAYER_ID_PATTERN.test(value));
+
+async function resolvePlayerId(db, value) {
+  if (typeof value === "string" && PUBLIC_PLAYER_ID_PATTERN.test(value)) {
+    const { rows } = await db.query(
+      "SELECT user_id FROM player_profiles WHERE UPPER(public_player_id) = UPPER($1)",
+      [value]
+    );
+    return rows[0]?.user_id ?? null;
+  }
+  return parseId(value);
+}
+
+const escapeLike = value => value.replace(/[\\%_]/g, character => `\\${character}`);
 
 const parsePage = value => {
   if (value === undefined) return 1;
@@ -85,6 +104,16 @@ async function isBlocked(db, playerA, playerB) {
   return rows[0].blocked;
 }
 
+async function isBlockedBy(db, blockerId, blockedId) {
+  const { rows } = await db.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2
+     ) AS blocked`,
+    [blockerId, blockedId]
+  );
+  return rows[0].blocked;
+}
+
 export function createSocialRouter(db) {
   const router = express.Router();
   const readLimiter = socialLimiter(60_000, 60);
@@ -93,41 +122,71 @@ export function createSocialRouter(db) {
   router.use(requireAuth);
   router.use(readLimiter);
   router.use(asyncRoute(async (req, res, next) => {
-    await db.query(
-      `INSERT INTO player_profiles(user_id, display_name, last_seen_at)
-       SELECT id, username, CURRENT_TIMESTAMP FROM users WHERE id = $1
-       ON CONFLICT (user_id) DO UPDATE SET last_seen_at = CURRENT_TIMESTAMP`,
-      [req.user.id]
-    );
+    await ensurePlayerProfile(db, req.user.id, req.user.username);
     next();
   }));
 
-  router.get("/players/search", asyncRoute(async (req, res) => {
+  const searchLimiter = socialLimiter(60_000, 30);
+
+  router.get("/me/profile", asyncRoute(async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT p.public_player_id AS id, u.username, '07' AS realm,
+              COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
+              COALESCE(g.victories, 0) AS victories,
+              COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
+       FROM users u
+       JOIN player_profiles p ON p.user_id = u.id
+       LEFT JOIN games g ON g.user_id = u.id
+       WHERE u.id = $1`,
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Player profile not found" });
+    res.json(rows[0]);
+  }));
+
+  router.get("/players/stats", asyncRoute(async (req, res) => {
+    const { rows } = await db.query(
+      "SELECT COUNT(*)::INTEGER AS \"registeredPlayers\" FROM users"
+    );
+    res.json(rows[0]);
+  }));
+
+  router.get("/players/search", searchLimiter, asyncRoute(async (req, res) => {
     const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
     const pagination = pageOptions(req.query);
-    if (!/^[A-Za-z0-9_]{2,20}$/.test(query) || !pagination) {
+    const publicIdSearch = PUBLIC_PLAYER_ID_PATTERN.test(query);
+    if ((!/^[A-Za-z0-9_]{2,20}$/.test(query) && !publicIdSearch) || !pagination) {
       return res.status(400).json({ error: "Invalid search query or pagination" });
     }
 
     const { rows } = await db.query(
-      `SELECT u.id, u.username, '${REALM_NAME}' AS realm,
+      `SELECT p.public_player_id AS id, u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
               COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
        FROM users u
-       LEFT JOIN player_profiles p ON p.user_id = u.id
+       JOIN player_profiles p ON p.user_id = u.id
        LEFT JOIN games g ON g.user_id = u.id
        WHERE u.id <> $1
-         AND u.username ILIKE $2
+         AND (
+           ($2::BOOLEAN AND UPPER(p.public_player_id) = UPPER($3))
+           OR (NOT $2::BOOLEAN AND LOWER(u.username) LIKE LOWER($4) ESCAPE E'\\\\')
+         )
          AND NOT EXISTS (
            SELECT 1 FROM blocked_users b
-           WHERE (b.blocker_id = $1 AND b.blocked_id = u.id)
-              OR (b.blocker_id = u.id AND b.blocked_id = $1)
+           WHERE b.blocker_id = u.id AND b.blocked_id = $1
          )
        ORDER BY u.username ASC
-       LIMIT $3 OFFSET $4`,
-      [req.user.id, `${query}%`, pagination.limit, pagination.offset]
+       LIMIT $5 OFFSET $6`,
+      [
+        req.user.id,
+        publicIdSearch,
+        query,
+        `${escapeLike(query)}%`,
+        pagination.limit,
+        pagination.offset
+      ]
     );
     res.json({
       players: rows,
@@ -163,21 +222,22 @@ export function createSocialRouter(db) {
   }));
 
   router.get("/players/:id", asyncRoute(async (req, res) => {
-    const playerId = parseId(req.params.id);
-    if (playerId === null) return res.status(400).json({ error: "Invalid player id" });
-    if (playerId !== req.user.id && await isBlocked(db, req.user.id, playerId)) {
+    if (!isPlayerReference(req.params.id)) return res.status(400).json({ error: "Invalid player id" });
+    const playerId = await resolvePlayerId(db, req.params.id);
+    if (playerId === null) return res.status(404).json({ error: "Player not found" });
+    if (playerId !== req.user.id && await isBlockedBy(db, playerId, req.user.id)) {
       return res.status(404).json({ error: "Player not found" });
     }
 
     const { rows } = await db.query(
-      `SELECT u.id, u.username, '${REALM_NAME}' AS realm,
+      `SELECT p.public_player_id AS id, u.username, '${REALM_NAME}' AS realm,
               COALESCE(p.display_name, u.username) AS "displayName",
               COALESCE(p.bio, '') AS bio,
               COALESCE(g.troops * 5 + g.castle * 20 + g.barracks * 8, 0) AS power,
               COALESCE(g.victories, 0) AS victories,
               COALESCE(p.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '${ONLINE_WINDOW_MINUTES} minutes', FALSE) AS online
        FROM users u
-       LEFT JOIN player_profiles p ON p.user_id = u.id
+       JOIN player_profiles p ON p.user_id = u.id
        LEFT JOIN games g ON g.user_id = u.id
        WHERE u.id = $1`,
       [playerId]
@@ -249,8 +309,11 @@ export function createSocialRouter(db) {
   }));
 
   router.post("/friends/requests", writeLimiter, asyncRoute(async (req, res) => {
-    const playerId = parseId(req.body?.playerId);
-    if (playerId === null) return res.status(400).json({ error: "Valid playerId is required" });
+    if (!isPlayerReference(req.body?.playerId)) {
+      return res.status(400).json({ error: "Valid playerId is required" });
+    }
+    const playerId = await resolvePlayerId(db, req.body.playerId);
+    if (playerId === null) return res.status(404).json({ error: "Player not found" });
     if (playerId === req.user.id) return res.status(400).json({ error: "Cannot send a request to yourself" });
 
     try {
@@ -376,8 +439,9 @@ export function createSocialRouter(db) {
   }));
 
   router.delete("/friends/:playerId", writeLimiter, asyncRoute(async (req, res) => {
-    const playerId = parseId(req.params.playerId);
-    if (playerId === null) return res.status(400).json({ error: "Invalid player id" });
+    if (!isPlayerReference(req.params.playerId)) return res.status(400).json({ error: "Invalid player id" });
+    const playerId = await resolvePlayerId(db, req.params.playerId);
+    if (playerId === null) return res.status(404).json({ error: "Player not found" });
     if (playerId === req.user.id) return res.status(400).json({ error: "Cannot remove yourself as a friend" });
     await db.query(
       "DELETE FROM friendships WHERE player_low_id = LEAST($1::integer, $2::integer) AND player_high_id = GREATEST($1::integer, $2::integer)",
@@ -387,8 +451,9 @@ export function createSocialRouter(db) {
   }));
 
   router.post("/blocks/:playerId", writeLimiter, asyncRoute(async (req, res) => {
-    const playerId = parseId(req.params.playerId);
-    if (playerId === null) return res.status(400).json({ error: "Invalid player id" });
+    if (!isPlayerReference(req.params.playerId)) return res.status(400).json({ error: "Invalid player id" });
+    const playerId = await resolvePlayerId(db, req.params.playerId);
+    if (playerId === null) return res.status(404).json({ error: "Player not found" });
     if (playerId === req.user.id) return res.status(400).json({ error: "Cannot block yourself" });
 
     const result = await withTransaction(db, async client => {
@@ -421,8 +486,9 @@ export function createSocialRouter(db) {
   }));
 
   router.delete("/blocks/:playerId", writeLimiter, asyncRoute(async (req, res) => {
-    const playerId = parseId(req.params.playerId);
-    if (playerId === null) return res.status(400).json({ error: "Invalid player id" });
+    if (!isPlayerReference(req.params.playerId)) return res.status(400).json({ error: "Invalid player id" });
+    const playerId = await resolvePlayerId(db, req.params.playerId);
+    if (playerId === null) return res.status(404).json({ error: "Player not found" });
     if (playerId === req.user.id) return res.status(400).json({ error: "Cannot unblock yourself" });
     await db.query(
       "DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2",
